@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 import logging
 import os
 import platform
@@ -56,6 +57,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -85,6 +87,11 @@ LOCK_FILE_NAME = "pcmon-bridge.lock"
 LOG_FILE_NAME = "pcmon-bridge.log"
 LOG_MAX_BYTES = 1_000_000
 LOG_BACKUP_COUNT = 2
+
+# The daemon runs windowless (pythonw via the logon task). Child console
+# programs such as nvidia-smi or powershell would otherwise each pop a new
+# console window on Windows; on other platforms the flag does not exist.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def state_dir() -> str:
@@ -299,6 +306,110 @@ def _current_user() -> str:
         return ""
 
 
+class LhmSensors:
+    """Best-effort reader for LibreHardwareMonitor's built-in web server.
+
+    psutil cannot read temperatures or fan speeds on Windows, and laptop
+    GPUs do not report fan speed through nvidia-smi. When LibreHardware
+    Monitor runs its remote web server it publishes the sensor tree as JSON
+    at ``http://127.0.0.1:8085/data.json``; reading it over loopback needs
+    no subprocess. Failures are cached, so a missing LibreHardwareMonitor
+    costs one probe every PROBE_PERIOD, not per sample.
+    """
+
+    URL = "http://127.0.0.1:8085/data.json"
+    PROBE_PERIOD_S = 30.0
+    READ_PERIOD_S = 1.5
+    TIMEOUT_S = 3.0
+
+    _VALUE_RE = re.compile(r"\s*(-?\d+(?:[.,]\d+)?)")
+
+    def __init__(self, url: str | None = None) -> None:
+        self._url = url or self.URL
+        self._next_probe = 0.0
+        self._available = False
+        self._last_read = 0.0
+        self._cpu_temp: float | None = None
+        self._gpu_fan: float | None = None
+
+    @staticmethod
+    def _walk(node, out) -> None:
+        if node.get("SensorId"):
+            out.append(node)
+        for child in node.get("Children") or ():
+            LhmSensors._walk(child, out)
+
+    @staticmethod
+    def _parse_value(text) -> float | None:
+        # Sensor values arrive formatted and culture-dependent, e.g.
+        # "77.0 °C", "77,0 °C" or "45.0 %"; take the leading number.
+        match = LhmSensors._VALUE_RE.match(text or "")
+        if not match:
+            return None
+        try:
+            return float(match.group(1).replace(",", "."))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def select(root) -> tuple[float | None, float | None]:
+        """Pick (cpu_temp_C, gpu_fan_percent) from the LHM data.json tree."""
+        leaves: list = []
+        LhmSensors._walk(root, leaves)
+        cpu_temp: float | None = None
+        gpu_fan: float | None = None
+        for node in leaves:
+            sensor_id = (node.get("SensorId") or "").lower()
+            sensor_type = node.get("Type") or ""
+            text = (node.get("Text") or "").lower()
+            value = LhmSensors._parse_value(node.get("Value"))
+            if value is None:
+                continue
+            if sensor_type == "Temperature" and sensor_id.startswith(
+                ("/intelcpu/", "/amdcpu/")
+            ):
+                if cpu_temp is None or "package" in text:
+                    cpu_temp = value
+            elif (
+                sensor_type in ("Fan", "Control")
+                and "/gpu" in sensor_id
+                and "fan" in text
+            ):
+                gpu_fan = value
+        return cpu_temp, gpu_fan
+
+    def _refresh(self) -> None:
+        if platform.system() != "Windows":
+            return
+        now = time.monotonic()
+        if now - self._last_read < self.READ_PERIOD_S:
+            return
+        if not self._available and now < self._next_probe:
+            return
+        self._last_read = now
+        try:
+            with urllib.request.urlopen(self._url, timeout=self.TIMEOUT_S) as resp:
+                root = json.loads(resp.read().decode("utf-8"))
+        except (OSError, ValueError):
+            self._available = False
+            self._next_probe = now + self.PROBE_PERIOD_S
+            return
+        self._available = True
+        cpu_temp, gpu_fan = self.select(root)
+        if cpu_temp is not None:
+            self._cpu_temp = cpu_temp
+        if gpu_fan is not None:
+            self._gpu_fan = gpu_fan
+
+    def cpu_temp(self) -> float | None:
+        self._refresh()
+        return self._cpu_temp
+
+    def gpu_fan(self) -> float | None:
+        self._refresh()
+        return self._gpu_fan
+
+
 class GpuSampler:
     """Collect GPU metrics.
 
@@ -306,6 +417,9 @@ class GpuSampler:
     extra dependency): utilization, VRAM, temperature, fan, and power. When no
     NVIDIA tool is present the adapter name is read from WMI so at least the
     model is shown. Queried only while the device displays the GPU page.
+
+    Laptop GPUs report fan speed as N/A through nvidia-smi; when an
+    LhmSensors reader is given, its fan reading fills that gap.
     """
 
     _NVIDIA_QUERY = (
@@ -314,7 +428,8 @@ class GpuSampler:
     )
     _UNKNOWN = {"", "n/a", "[not supported]", "[n/a]", "unknown", "none"}
 
-    def __init__(self) -> None:
+    def __init__(self, lhm: LhmSensors | None = None) -> None:
+        self._lhm = lhm
         self._fallback_name: str | None = None
         self._fallback_checked = False
 
@@ -338,6 +453,7 @@ class GpuSampler:
                 capture_output=True,
                 text=True,
                 timeout=4,
+                creationflags=_NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -366,6 +482,8 @@ class GpuSampler:
         if temp is not None:
             fields.append(("t", f"{temp:.1f}"))
         fan = self._num(parts[5])
+        if fan is None and self._lhm is not None:
+            fan = self._lhm.gpu_fan()
         if fan is not None:
             fields.append(("fn", f"{fan:.0f}"))
         power = self._num(parts[6])
@@ -391,6 +509,7 @@ class GpuSampler:
                 capture_output=True,
                 text=True,
                 timeout=8,
+                creationflags=_NO_WINDOW,
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -420,7 +539,8 @@ class Sampler:
         self.os_name = sanitize(f"{platform.system()} {platform.release()}")
         self.user = sanitize(_current_user())
         self.cpu_model = sanitize(_cpu_model())
-        self.gpu = GpuSampler()
+        self.lhm = LhmSensors()
+        self.gpu = GpuSampler(self.lhm)
         self._prime_process_cpu()
 
     def _prime_process_cpu(self) -> None:
@@ -547,17 +667,17 @@ class Sampler:
         return fields
 
     def _cpu_temp(self) -> float | None:
-        if not hasattr(psutil, "sensors_temperatures"):
-            return None
-        try:
-            sensors = psutil.sensors_temperatures()
-        except (AttributeError, OSError):
-            return None
-        for entries in (sensors or {}).values():
-            for entry in entries:
-                if entry.current:
-                    return float(entry.current)
-        return None
+        if hasattr(psutil, "sensors_temperatures"):
+            try:
+                sensors = psutil.sensors_temperatures()
+            except (AttributeError, OSError):
+                sensors = None
+            for entries in (sensors or {}).values():
+                for entry in entries:
+                    if entry.current:
+                        return float(entry.current)
+        # Windows: psutil has no temperature support at all.
+        return self.lhm.cpu_temp()
 
     def top_processes(self, sort: int = 0) -> list[tuple[str, float, float]]:
         """Return up to PCMON_PROC_MAX (name, cpu%, mem_MB) rows.

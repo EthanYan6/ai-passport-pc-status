@@ -90,6 +90,70 @@ class FrameTest(unittest.TestCase):
         self.assertEqual(frame, b"$PCGPU,v=nvidia,u=23.0#\n")
 
 
+class LhmSelectTest(unittest.TestCase):
+    @staticmethod
+    def _tree(*sensors):
+        """Build a minimal LHM data.json tree from (id, type, text, value)."""
+        return {
+            "Text": "Sensor",
+            "Children": [
+                {
+                    "Text": text,
+                    "Type": sensor_type,
+                    "SensorId": sensor_id,
+                    "Value": value,
+                    "Children": [],
+                }
+                for sensor_id, sensor_type, text, value in sensors
+            ],
+        }
+
+    def test_prefers_cpu_package_temperature(self):
+        root = self._tree(
+            ("/intelcpu/0/temperature/0", "Temperature", "Core Max", "61.0 °C"),
+            ("/intelcpu/0/temperature/26", "Temperature", "CPU Package", "72.5 °C"),
+        )
+        cpu_temp, gpu_fan = BRIDGE.LhmSensors.select(root)
+        self.assertEqual(cpu_temp, 72.5)
+        self.assertIsNone(gpu_fan)
+
+    def test_falls_back_to_any_cpu_temperature(self):
+        root = self._tree(
+            ("/amdcpu/0/temperature/2", "Temperature", "Core (Tctl/Tdie)", "55.0 °C"),
+        )
+        cpu_temp, _ = BRIDGE.LhmSensors.select(root)
+        self.assertEqual(cpu_temp, 55.0)
+
+    def test_parses_culture_dependent_decimal_comma(self):
+        root = self._tree(
+            ("/intelcpu/0/temperature/26", "Temperature", "CPU Package", "66,5 °C"),
+        )
+        cpu_temp, _ = BRIDGE.LhmSensors.select(root)
+        self.assertEqual(cpu_temp, 66.5)
+
+    def test_gpu_fan_control_percent(self):
+        root = self._tree(
+            ("/lpc/ec/0/control/0", "Control", "CPU Fan", "43.0 %"),
+            ("/gpu-nvidia/0/control/0", "Control", "GPU Fan", "51.0 %"),
+        )
+        _, gpu_fan = BRIDGE.LhmSensors.select(root)
+        self.assertEqual(gpu_fan, 51.0)
+
+    def test_unrelated_and_bad_sensors_are_ignored(self):
+        root = self._tree(
+            ("/gpu-nvidia/0/temperature/0", "Temperature", "GPU Core", "49.0 °C"),
+            ("/lpc/ec/0/fan/0", "Fan", "GPU Fan", "2400.0 RPM"),
+            ("/gpu-nvidia/0/control/0", "Control", "GPU Fan", "N/A"),
+        )
+        cpu_temp, gpu_fan = BRIDGE.LhmSensors.select(root)
+        self.assertIsNone(cpu_temp)
+        self.assertIsNone(gpu_fan)
+
+    def test_empty_input(self):
+        self.assertEqual(BRIDGE.LhmSensors.select({"Children": []}), (None, None))
+        self.assertEqual(BRIDGE.LhmSensors.select({}), (None, None))
+
+
 class DetectPortTest(unittest.TestCase):
     def _detect(self, ports, explicit=None):
         with patch.object(BRIDGE.list_ports, "comports", return_value=ports):
